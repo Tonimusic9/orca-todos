@@ -5,7 +5,7 @@ import {
   Box,
   Button,
   Callout,
-  Checkbox,
+  Code,
   Collapsible,
   EmptyState,
   Heading,
@@ -15,6 +15,7 @@ import {
   read,
   Row,
   Select,
+  Separator,
   set,
   Spinner,
   Stack,
@@ -124,38 +125,80 @@ function ConfirmStep({ task, agents }: { task: Task; agents: AgentInfo[] }) {
   )
 }
 
+/** Task text with `inline code` drawn as code. */
+function RichText({ text, muted }: { text: string; muted?: boolean }) {
+  const parts = text.split(/(`[^`]+`)/).filter(Boolean)
+  return (
+    <Text muted={muted} size="sm">
+      {parts.map((part) => (part.startsWith('`') && part.endsWith('`') ? <Code>{part.slice(1, -1)}</Code> : part))}
+    </Text>
+  )
+}
+
+function toggle(task: Task): void {
+  const open = read(confirming) === task.id
+  if (open) set(confirming, null)
+  else if (task.owner === 'me' && !task.done) openConfirm(task)
+  else void run(() => plugin.request('todos.setDone', { id: task.id, done: !task.done }))
+}
+
 function TaskRow({ task, agents }: { task: Task; agents: AgentInfo[] }) {
   const open = read(confirming) === task.id
   return (
-    <Stack gap="xs">
-      <Checkbox
-        label={task.text}
-        checked={task.done || open}
-        onChange={(checked) => {
-          if (task.owner === 'me' && checked && !task.done) openConfirm(task)
-          else if (open && !checked) set(confirming, null)
-          else void run(() => plugin.request('todos.setDone', { id: task.id, done: checked }))
-        }}
-      />
+    <Stack gap="sm">
+      <Box direction="row" gap="sm" align="start" paddingY="xs">
+        <IconButton
+          // Orca's `stop` glyph is an outlined square: an empty checkbox. Done tasks get a filled check.
+          icon={task.done ? 'check' : 'stop'}
+          size="sm"
+          variant={task.done ? 'solid' : 'ghost'}
+          tone={task.done ? 'success' : open ? 'accent' : 'neutral'}
+          label={task.done ? `Mark not done: ${task.text}` : `Mark done: ${task.text}`}
+          tooltip={task.done ? 'Mark not done' : task.owner === 'me' ? 'Mark done and tell an agent' : 'Mark done'}
+          onPress={() => toggle(task)}
+        />
+        <Box grow paddingY="xs">
+          <RichText text={task.text} muted={task.done} />
+        </Box>
+      </Box>
       {open ? <ConfirmStep task={task} agents={agents} /> : null}
     </Stack>
   )
 }
 
-function Section({ title, tasks, agents, tone }: { title: string; tasks: Task[]; agents: AgentInfo[]; tone: 'warning' | 'neutral' }) {
+function Section({
+  title,
+  hint,
+  tasks,
+  agents,
+  tone
+}: {
+  title: string
+  hint?: string
+  tasks: Task[]
+  agents: AgentInfo[]
+  tone: 'warning' | 'neutral'
+}) {
   if (!tasks.length) return null
   return (
-    <Stack gap="xs">
-      <Row justify="between">
-        <Text weight="semibold" size="sm">
-          {title}
-        </Text>
-        <Badge tone={tone}>{String(tasks.length)}</Badge>
-      </Row>
-      {tasks.map((task) => (
-        <TaskRow task={task} agents={agents} />
-      ))}
-    </Stack>
+    <Box padding="md" gap="sm" radius="lg" border={tone === 'warning' ? 'warning' : true} background="card">
+      <Stack gap="none">
+        <Row justify="between" align="center">
+          <Text weight="semibold">{title}</Text>
+          <Badge tone={tone}>{String(tasks.length)}</Badge>
+        </Row>
+        {hint ? (
+          <Text muted size="xs">
+            {hint}
+          </Text>
+        ) : null}
+      </Stack>
+      <Stack gap="xs">
+        {tasks.map((task) => (
+          <TaskRow task={task} agents={agents} />
+        ))}
+      </Stack>
+    </Box>
   )
 }
 
@@ -188,14 +231,14 @@ export default function Panel() {
   const message = read(error)
 
   return (
-    <Stack gap="md">
+    <Box gap="lg" paddingY="sm">
       <Stack gap="xs">
-        <Row justify="between">
+        <Row justify="between" align="center">
           <Heading>Todos</Heading>
           {current.exists ? <Badge tone={mine.length ? 'warning' : 'neutral'}>{`${mine.length + theirs.length} open`}</Badge> : null}
         </Row>
         <Text muted size="xs" truncate>
-          {current.workspace.name} · TODO.md
+          {`${current.workspace.path.replace(/^\/Users\/[^/]+/, '~')}/TODO.md`}
         </Text>
       </Stack>
 
@@ -220,17 +263,26 @@ export default function Panel() {
         </Text>
       ) : null}
 
-      <Section title="Waiting on you" tasks={mine} agents={agents} tone="warning" />
+      <Section
+        title="Waiting on you"
+        hint="Check one off to tell an agent it's done."
+        tasks={mine}
+        agents={agents}
+        tone="warning"
+      />
       <Section title="Agent tasks" tasks={theirs} agents={agents} tone="neutral" />
 
       {queue.length ? (
-        <Stack gap="xs">
-          <Text weight="semibold" size="sm">
-            Queued messages
-          </Text>
+        <Box padding="md" gap="sm" radius="lg" border="accent" background="card">
+          <Stack gap="none">
+            <Text weight="semibold">Queued messages</Text>
+            <Text muted size="xs">
+              Sent when the agent is idle.
+            </Text>
+          </Stack>
           {queue.map((m) => (
-            <Row justify="between" gap="xs">
-              <Text size="xs" truncate>
+            <Row justify="between" align="center" gap="sm">
+              <Text size="sm" truncate>
                 {`→ ${m.agentLabel}: ${m.taskText}`}
               </Text>
               <IconButton
@@ -242,7 +294,7 @@ export default function Panel() {
               />
             </Row>
           ))}
-        </Stack>
+        </Box>
       ) : null}
 
       {done.length ? (
@@ -256,7 +308,8 @@ export default function Panel() {
       ) : null}
 
       {!current.problem ? (
-        <Stack gap="xs">
+        <Stack gap="sm">
+          <Separator />
           <Input
             label="New task"
             labelHidden
@@ -265,7 +318,7 @@ export default function Panel() {
             onChange={(value) => set(draft, value)}
             onSubmit={addDraft}
           />
-          <Row gap="xs">
+          <Row gap="sm" justify="between">
             <Select
               label="For"
               labelHidden
@@ -276,7 +329,7 @@ export default function Panel() {
               ]}
               onChange={(value) => set(draftOwner, value as Owner)}
             />
-            <Button icon="add" onPress={addDraft} disabled={!read(draft).trim()}>
+            <Button icon="add" tone="accent" onPress={addDraft} disabled={!read(draft).trim()}>
               Add
             </Button>
           </Row>
@@ -285,10 +338,10 @@ export default function Panel() {
 
       {agents.length ? (
         <Collapsible title={`Agents here (${agents.length})`}>
-          <Stack gap="xs">
+          <Stack gap="sm">
             {agents.map((a) => (
-              <Row justify="between" gap="xs">
-                <Row gap="xs">
+              <Row justify="between" align="center" gap="sm">
+                <Row gap="sm" align="center">
                   <Text size="sm" truncate>
                     {a.label}
                   </Text>
@@ -307,6 +360,6 @@ export default function Panel() {
           </Stack>
         </Collapsible>
       ) : null}
-    </Stack>
+    </Box>
   )
 }

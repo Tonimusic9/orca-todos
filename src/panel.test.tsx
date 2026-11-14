@@ -27,7 +27,7 @@ test('checking a manual task opens the confirm step and sends to the picked agen
     }
   })
   const view = await mount(panel, { host })
-  await view.toggle({ label: 'Add the API key' })
+  await view.press({ label: 'Mark done: Add the API key' })
   assert.ok(view.find({ text: 'Done with this?' }))
   // Defaults to the idle agent.
   assert.equal(view.valueOf({ label: 'Tell which agent' }), 't2')
@@ -47,7 +47,7 @@ test('checking an agent task needs no confirm', async () => {
     requests: { 'todos.get': () => base, 'todos.setDone': (input) => (sets.push(input), base) }
   })
   const view = await mount(panel, { host })
-  await view.toggle({ label: 'Wire it up' })
+  await view.press({ label: 'Mark done: Wire it up' })
   assert.deepEqual(sets, [{ id: base.tasks[1].id, done: true }])
   assert.equal(view.find({ text: 'Done with this?' }), null)
   await view.unmount()
