@@ -1,0 +1,34 @@
+{
+  "manifestVersion": 2,
+  "id": "todos",
+  "name": "Todos",
+  "version": "0.1.0",
+  "description": "A shared TODO.md task list between you and your agents: agents add and check off tasks, and when you check off one they asked you to do, the agent you pick gets told.",
+  "engines": {
+    "orca": ">=1.4.248"
+  },
+  "execution": "trusted-worker",
+  "pluginApi": 1,
+  "main": "src/worker.ts",
+  "contributes": {
+    "panels": [
+      {
+        "id": "todos",
+        "title": "Todos",
+        "icon": "check",
+        "entry": "src/panel.tsx",
+        "ui": "components"
+      }
+    ],
+    "events": [
+      { "on": "workspace.changed" },
+      { "on": "agent.status.changed" }
+    ]
+  },
+  "capabilities": [
+    { "kind": "storage:own" },
+    { "kind": "workspace:read" },
+    { "kind": "agent:read" },
+    { "kind": "terminal:send" }
+  ]
+}

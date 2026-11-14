@@ -1,0 +1,13 @@
+{
+  "name": "orca-todos",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc -p .",
+    "test": "orca plugin test . && orca plugin check ."
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
