@@ -47,4 +47,19 @@ orca plugin open local.project-progress --panel progress --json
 
 Os testes cobrem renderização e expansão de fases, 9 de 15 folhas (60%), hierarquia, código cercado, fase vazia, troca de workspace, seleção persistente, atualização com save atômico e tratamento de erro de leitura. Os planos em [fixtures/sample](fixtures/sample) e [fixtures/other](fixtures/other) servem de exemplo.
 
+## Criar um plano com a skill `project-plan`
+
+A skill `project-plan` escreve um `PROJECT_PLAN.md` na raiz da worktree no formato exato que este painel lê. Ela está disponível no Codex, Claude Code e OpenCode. Para usar, peça no chat do projeto:
+
+> Crie o `PROJECT_PLAN.md` deste projeto com a skill `project-plan`.
+
+A skill lê o contexto da worktree, organiza fases com `##`, tarefas com `- [ ]` e `- [x]`, usa `@doing` para itens em andamento e indenta subtarefas com dois espaços. Ela nunca sobrescreve um plano existente sem perguntar. Ao salvar, o painel atualiza sozinho.
+
+## Documentação do projeto
+
+- [HANDOFF.md](HANDOFF.md) — decisões, critérios A1–A12 verificados e registro de sessões.
+- [PROMPT_MESTRE_CODEX_GOAL_ORCA_PROJECT_PROGRESS.md](PROMPT_MESTRE_CODEX_GOAL_ORCA_PROJECT_PROGRESS.md) — escopo, aceitação e regras anti-loop.
+- [AGENTS.md](AGENTS.md), [CLAUDE.md](CLAUDE.md) e [GEMINI.md](GEMINI.md) — regras para agentes.
+- [PROJECT_PLAN.md](PROJECT_PLAN.md) — checklist de entrega deste MVP.
+
 Derivado de [Todos for Orca](https://github.com/jonstuebe/orca-todos), de Jon Stuebe. [Licença MIT](LICENSE).
