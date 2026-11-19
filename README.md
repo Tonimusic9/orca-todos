@@ -1,44 +1,50 @@
-# Todos for Orca
+# Project Progress para ORCA
 
-A sidebar panel that shows the focused worktree's `TODO.md`, shared between you and your coding agents. It works with any agent, because agents just edit a markdown file.
+Veja o checklist do workspace em foco na barra lateral direita do ORCA. O painel mostra o percentual geral, fases expansíveis e tarefas aninhadas. A edição é feita no Markdown. O painel reflete o arquivo após cada gravação, inclusive quando um editor o substitui em um save atômico.
 
-- **Agents** add tasks as they work and check them off when done. The panel updates live.
-- **Tasks for you** (`@me`): when you check one off, a confirm step asks which agent to tell. The message is queued and typed into that agent's terminal once it is idle (never mid-turn, never into a permission prompt).
+## Plano do workspace
 
-## TODO.md format
+A descoberta usa esta ordem dentro da raiz do workspace local ativo:
 
-```markdown
-- [ ] @agent Write the users migration   <- the agent does it (untagged also means agent)
-- [ ] @me Add STRIPE_KEY to .env         <- the agent needs you to do it
-- [x] @agent Add tests                   <- done
-```
+`PROJECT_PLAN.md` → `PLAN.md` → `ROADMAP.md` → `TASKS.md` → `TODO.md` → `docs/PLAN.md` → `docs/ROADMAP.md`.
 
-All other lines are left as they are. "Create TODO.md" in the panel writes a header comment that explains the format to agents.
-
-## Teaching agents the format
-
-Either press **Brief** next to an agent in the panel's "Agents here" section, or add this to your `AGENTS.md` / `CLAUDE.md`:
+A primeira fonte com checkboxes utilizáveis vira o plano. Quando há várias, **Plano canônico** permite escolher uma. A preferência fica no armazenamento do plugin por workspace. Se o arquivo escolhido sumir ou ficar vazio, o painel volta à ordem de descoberta. A contagem é sempre de uma fonte por vez.
 
 ```markdown
-## Task list
-Keep `TODO.md` at the worktree root current as you work. Add tasks you plan to do as
-`- [ ] @agent <task>` and check them off when done. When you need me to do something by hand,
-add `- [ ] @me <task>`; when I check it off you will get a terminal message starting with `[todos]`.
+# Plano de entrega
+
+## Planejamento
+- [x] Definir requisitos
+
+## Implementação
+- [ ] Entregar painel
+  - [x] Desenhar checklist
+  - [ ] @doing Conferir na sidebar
 ```
 
-## How it works
+O primeiro `#` serve de título do documento. Os demais cabeçalhos organizam fases. Apenas checkboxes sem subtarefas contam para os percentuais. `[x]` marca conclusão e `@doing` no início de uma tarefa aberta marca andamento. `@me` e `@agent` continuam aceitos em arquivos legados. Fases vazias mostram **Sem tarefas**.
 
-- `src/worker.ts`: a Node worker that finds the focused worktree, watches `TODO.md`, edits it, and keeps the message queue in plugin storage (so it survives restarts).
-- `src/panel.tsx`: the components panel.
-- `src/todo-file.ts`: parsing and editing, pure functions.
+Ao trocar de worktree, o painel usa a raiz do novo worktree. Se houver gravações concorrentes, o painel reflete o texto que ficou no disco. Se a leitura falhar, mostra o erro e sinaliza a última leitura válida do workspace, quando disponível. Links simbólicos ficam fora da descoberta.
 
-Orca identifies the focused workspace only by display name and branch. When several projects share them (lots of `main`s), the worker uses agent events (which carry the workspace id) to tell them apart. If that isn't enough, the panel asks once and remembers the answer through that workspace's terminals.
+## Desenvolvimento e ativação
 
-## Develop
+Use o ORCA 1.4.248 ou superior. As verificações foram feitas com o ORCA 1.4.262.
 
 ```sh
-npm install
+npm ci
+orca plugin types . --json
 npm run typecheck
-npm test                       # orca plugin test + orca plugin check
-orca plugin dev load . --json  # load into Orca (asks for approval the first time)
+npm test
+orca plugin validate . --json
+orca plugin dev load . --json
 ```
+
+Na primeira carga o ORCA pede consentimento para executar o worker Node com acesso da conta do usuário, consultar os workspaces e guardar a escolha do plano no armazenamento próprio. Depois de autorizar, clique em **Project Progress** na barra lateral direita. O ícone do explorador volta à árvore de arquivos. Também é possível abrir o painel com:
+
+```sh
+orca plugin open local.project-progress --panel progress --json
+```
+
+Os testes cobrem renderização e expansão de fases, 9 de 15 folhas (60%), hierarquia, código cercado, fase vazia, troca de workspace, seleção persistente, atualização com save atômico e tratamento de erro de leitura. Os planos em [fixtures/sample](fixtures/sample) e [fixtures/other](fixtures/other) servem de exemplo.
+
+Derivado de [Todos for Orca](https://github.com/jonstuebe/orca-todos), de Jon Stuebe. [Licença MIT](LICENSE).

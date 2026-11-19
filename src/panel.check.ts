@@ -1,23 +1,22 @@
-// `orca plugin check` renders the panel once per scenario against a stand-in host.
+// O ORCA renderiza cada cenário com um workspace de fixture.
 import { defineCheck } from 'orca/testing'
+import { fileURLToPath } from 'node:url'
 
-const sample = new URL('../fixtures/sample', import.meta.url).pathname
-
-export default defineCheck({
-  noWorkspace: {},
-  tasks: {
+function scenario(folder: string, project: string) {
+  const path = fileURLToPath(new URL(`../fixtures/${folder}`, import.meta.url))
+  return {
     results: {
-      'workspace.readContext': { branch: 'main', displayName: 'main', terminals: [] },
+      'workspace.readContext': { workspaceId: 'w1', branch: 'main', displayName: 'main', terminals: [] },
       'workspace.list': {
-        workspaces: [{ id: 'w1', kind: 'worktree', name: 'main', path: sample, branch: 'main', hostId: 'local' }],
+        workspaces: [{ id: 'w1', kind: 'worktree', name: 'main', project, path, branch: 'main', hostId: 'local' }],
         truncated: false
-      },
-      'agents.list': {
-        agents: [
-          { terminalId: 't1', title: 'Claude', agent: 'claude', state: 'working', stateStartedAt: 0 },
-          { terminalId: 't2', title: 'Codex', agent: 'codex', state: 'waiting', stateStartedAt: 0 }
-        ]
       }
     }
   }
+}
+
+export default defineCheck({
+  noWorkspace: {},
+  tasks: scenario('sample', 'Projeto exemplo'),
+  emptyPhase: scenario('other', 'Documentação')
 })

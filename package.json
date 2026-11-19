@@ -1,10 +1,10 @@
 {
-  "name": "orca-todos",
+  "name": "orca-project-progress",
   "private": true,
   "type": "module",
   "scripts": {
     "typecheck": "tsc -p .",
-    "test": "orca plugin test . && orca plugin check ."
+    "test": "orca plugin test . --json && orca plugin check . --json"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

@@ -1,79 +1,70 @@
 import { assert, mockHost, mount, test } from 'orca/testing'
 import * as panel from './panel'
-import type { TodoState } from './protocol'
+import type { ProgressState } from './protocol'
+import { parseTasks } from './todo-file'
 
-const base: TodoState = {
-  workspace: { name: 'feat/x', path: '/tmp/x' },
-  choices: [],
+const base: ProgressState = {
+  workspace: { id: 'w1', name: 'Projeto Orion' },
   problem: null,
-  exists: true,
-  tasks: [
-    { id: '2:- [ ] @me Add the API key', line: 2, done: false, owner: 'me', text: 'Add the API key' },
-    { id: '3:- [ ] @agent Wire it up', line: 3, done: false, owner: 'agent', text: 'Wire it up' }
-  ],
-  agents: [
-    { terminalId: 't1', label: 'Claude', agent: 'claude', state: 'working' },
-    { terminalId: 't2', label: 'Codex', agent: 'codex', state: 'waiting' }
-  ],
-  queue: []
+  file: 'PLAN.md',
+  candidates: ['PLAN.md'],
+  plan: parseTasks('# Roteiro\n## Lançamento\n- [x] Planejar\n  - [x] Escrever\n- [ ] @doing Revisar\n## Fase vazia')
 }
 
-test('checking a manual task opens the confirm step and sends to the picked agent', async () => {
-  const confirms: unknown[] = []
+test('mostra totais, fases expansíveis e tarefas de somente leitura', async () => {
+  const host = mockHost({ requests: { 'progress.get': () => base } })
+  const view = await mount(panel, { host })
+  try {
+    assert.ok(view.find({ text: 'Projeto Orion' }))
+    assert.ok(view.find({ text: '50%' }))
+    assert.ok(view.find({ text: '1 de 2 tarefas concluídas' }))
+    assert.ok(view.find({ text: 'PLAN.md' }))
+    assert.ok(view.find({ text: 'Escrever' }))
+    assert.ok(view.find({ text: 'Revisar' }))
+    assert.ok(view.find({ text: 'Sem tarefas' }))
+    assert.equal(view.findAll({ type: 'Checkbox' }).length, 0)
+    assert.equal(view.findAll({ type: 'Button' }).length, 0)
+    await view.toggle({ type: 'Collapsible', text: /Lançamento/ })
+    assert.equal(view.find({ text: 'Escrever' }), null)
+    assert.deepEqual(view.errors, [])
+    assert.deepEqual(view.warnings, [])
+  } finally {
+    await view.unmount()
+  }
+})
+
+test('recebe atualizações do worker e sinaliza quando os números são antigos', async () => {
+  const host = mockHost({ requests: { 'progress.get': () => base } })
+  const view = await mount(panel, { host })
+  try {
+    await view.post('progress.changed', { ...base, problem: 'Erro de leitura' })
+    assert.ok(view.find({ type: 'Callout', text: /Erro de leitura/ }))
+    assert.ok(view.find({ text: 'Última leitura válida' }))
+    await view.post('progress.changed', { ...base, plan: null, file: null, candidates: [] })
+    assert.ok(view.find({ type: 'EmptyState', label: 'Nenhum plano Markdown com checkboxes encontrado' }))
+    assert.equal(view.find({ text: '50%' }), null)
+  } finally {
+    await view.unmount()
+  }
+})
+
+test('oferece a escolha canônica apenas quando há mais de um plano', async () => {
+  const picks: unknown[] = []
   const host = mockHost({
     requests: {
-      'todos.get': () => base,
-      'todos.confirm': (input) => (confirms.push(input), base)
+      'progress.get': () => ({ ...base, candidates: ['PLAN.md', 'TODO.md'] }),
+      'progress.select': (input) => {
+        picks.push(input)
+        return { ...base, file: 'TODO.md' }
+      }
     }
   })
   const view = await mount(panel, { host })
-  await view.press({ label: 'Mark done: Add the API key' })
-  assert.ok(view.find({ text: 'Done with this?' }))
-  // Defaults to the idle agent.
-  assert.equal(view.valueOf({ label: 'Tell which agent' }), 't2')
-  await view.select({ label: 'Tell which agent' }, 't1')
-  assert.ok(view.find({ text: 'Claude is working; the message waits until it is idle.' }))
-  await view.press({ text: 'Check off & tell agent' })
-  assert.deepEqual(confirms, [{ id: base.tasks[0].id, terminalId: 't1' }])
-  assert.equal(view.find({ text: 'Done with this?' }), null)
-  assert.deepEqual(view.errors, [])
-  assert.deepEqual(view.warnings, [])
-  await view.unmount()
-})
-
-test('checking an agent task needs no confirm', async () => {
-  const sets: unknown[] = []
-  const host = mockHost({
-    requests: { 'todos.get': () => base, 'todos.setDone': (input) => (sets.push(input), base) }
-  })
-  const view = await mount(panel, { host })
-  await view.press({ label: 'Mark done: Wire it up' })
-  assert.deepEqual(sets, [{ id: base.tasks[1].id, done: true }])
-  assert.equal(view.find({ text: 'Done with this?' }), null)
-  await view.unmount()
-})
-
-test('offers to create TODO.md when missing', async () => {
-  const host = mockHost({ requests: { 'todos.get': () => ({ ...base, exists: false, tasks: [] }) } })
-  const view = await mount(panel, { host })
-  assert.ok(view.find({ text: 'Create TODO.md' }))
-  await view.unmount()
-})
-
-test('asks which project when the branch is ambiguous', async () => {
-  const picks: unknown[] = []
-  const ambiguous: TodoState = {
-    ...base,
-    workspace: null,
-    choices: [
-      { id: 'a', name: 'main', path: '/Users/me/code/a' },
-      { id: 'b', name: 'main', path: '/Users/me/code/b' }
-    ]
+  try {
+    await view.select({ label: 'Plano canônico' }, 'TODO.md')
+    assert.deepEqual(picks, [{ workspaceId: 'w1', file: 'TODO.md' }])
+    assert.ok(view.find({ text: 'TODO.md' }))
+  } finally {
+    await view.unmount()
   }
-  const host = mockHost({ requests: { 'todos.get': () => ambiguous, 'todos.pick': (input) => (picks.push(input), base) } })
-  const view = await mount(panel, { host })
-  await view.select({ label: 'Project' }, 'b')
-  assert.deepEqual(picks, [{ workspaceId: 'b' }])
-  assert.ok(view.find({ text: 'Agent tasks' }))
-  await view.unmount()
 })

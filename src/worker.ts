@@ -1,41 +1,51 @@
-// The plugin's worker: owns TODO.md for the focused worktree, watches it, and delivers the
-// messages the person confirms to an agent's terminal once that agent is idle.
-import { existsSync, watch, type FSWatcher } from 'node:fs'
-import { readFile, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+// Reutiliza a resolução de workspace e a observação de diretórios de orca-todos.
+import { constants, lstatSync, watch, type FSWatcher } from 'node:fs'
+import { open, realpath } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 import type { OrcaWorkerApi } from 'orca/worker'
-import type { AgentInfo, QueuedMessage, TodoState } from './protocol'
-import { addTask, parseTasks, setTaskDone, TODO_TEMPLATE, type Owner, type Task } from './todo-file'
+import type { ProgressState } from './protocol'
+import { parseTasks, type Plan } from './todo-file'
 
-const FILE = 'TODO.md'
-const QUEUE = 'queue'
-/** terminal id -> workspace id, learned from agent events and the person's picks. */
-const TERMINALS = 'terminalWorkspaces'
-/** States in which typing into the agent's terminal lands in its prompt, not mid-turn or in a
- *  permission dialog (`blocked`). */
-const IDLE = new Set<AgentInfo['state']>(['waiting', 'done'])
+const FILES = ['PROJECT_PLAN.md', 'PLAN.md', 'ROADMAP.md', 'TASKS.md', 'TODO.md', 'docs/PLAN.md', 'docs/ROADMAP.md']
+const shortBranch = (branch: string | null) => (branch ?? '').replace(/^refs\/heads\//, '')
+const errorCode = (error: unknown) => (error as NodeJS.ErrnoException).code
+const missing = (error: unknown) => ['ENOENT', 'ENOTDIR'].includes(errorCode(error) ?? '')
 
-type Context = { branch: string; displayName: string; terminals: { id: string }[] } | null
-type Candidate = { id: string; name: string; path: string; hostId: string | null }
-type Workspace = { id: string; name: string; path: string } | null
+type Context = { workspaceId?: string; branch: string; displayName: string } | null
+type Workspace = NonNullable<ProgressState['workspace']> & { path: string }
+type Snapshot = Pick<ProgressState, 'file' | 'candidates' | 'plan'>
 
-const shortBranch = (branch: string | null | undefined) => (branch ?? '').replace(/^refs\/heads\//, '')
+let stopWatching: (() => void) | undefined
 
-function hostError(code: string, message: string): Error {
-  return Object.assign(new Error(message), { code })
+async function readPlan(root: string, file: string): Promise<Plan | null> {
+  const path = join(root, file)
+  try {
+    // A lista é fixa e não acompanha links intermediários para fora do workspace.
+    if (await realpath(dirname(path)) !== dirname(path)) throw new Error('Link simbólico no caminho')
+    const handle = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+    try {
+      if (!(await handle.stat()).isFile()) throw new Error('O caminho não é um arquivo regular')
+      const plan = parseTasks(await handle.readFile('utf8'))
+      return plan.progress.total ? plan : null
+    } finally {
+      await handle.close()
+    }
+  } catch (error) {
+    if (missing(error)) return null
+    throw error
+  }
 }
 
-// Module scope so deactivate() can close them; a live watch keeps the worker process running.
-let watcher: FSWatcher | null = null
-let debounce: ReturnType<typeof setTimeout> | null = null
-
 export default function activate(orca: OrcaWorkerApi): void {
-  let workspace: Workspace = null
+  let workspace: Workspace | null = null
   let problem: string | null = null
-  /** Workspaces that match the focused one's name and branch when Orca's context cannot tell them apart. */
-  let choices: Candidate[] = []
-  let lastContext: Context = null
-  /** Serializes file writes and queue changes so two quick clicks cannot interleave. */
+  let watchProblem: string | null = null
+  let rootWatcher: FSWatcher | undefined
+  let docsWatcher: FSWatcher | undefined
+  let debounce: ReturnType<typeof setTimeout> | undefined
+  let refreshDocs = false
+  let preferred: string | undefined
+  let lastGood: Snapshot | undefined
   let chain: Promise<unknown> = Promise.resolve()
   const serial = <T>(work: () => Promise<T>): Promise<T> => {
     const next = chain.then(work, work)
@@ -43,296 +53,160 @@ export default function activate(orca: OrcaWorkerApi): void {
     return next
   }
 
-  const filePath = () => (workspace ? join(workspace.path, FILE) : null)
-
-  async function readTodo(): Promise<string | null> {
-    const path = filePath()
-    if (!path) return null
-    try {
-      return await readFile(path, 'utf8')
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
-      throw error
-    }
-  }
-
-  async function readQueue(): Promise<QueuedMessage[]> {
-    const value = await orca.storage.get(QUEUE)
-    return Array.isArray(value) ? (value as unknown as QueuedMessage[]) : []
-  }
-
-  async function writeQueue(queue: QueuedMessage[]): Promise<void> {
-    await orca.storage.set(QUEUE, queue as unknown as never)
-  }
-
-  async function listAgents(): Promise<AgentInfo[]> {
-    try {
-      const { agents } = await orca.host.call('agents.list')
-      const rows = agents.filter((a): a is typeof a & { terminalId: string } => !!a.terminalId)
-      const labels = rows.map((a) => a.title?.trim() || a.agent || 'Agent')
-      return rows.map((a, i) => ({
-        terminalId: a.terminalId,
-        // Two agents with the same title get their terminal id's tail so the picker can tell them apart.
-        label:
-          labels.indexOf(labels[i]) !== labels.lastIndexOf(labels[i])
-            ? `${labels[i]} (${a.terminalId.slice(-4)})`
-            : labels[i],
-        agent: a.agent,
-        state: a.state
-      }))
-    } catch (error) {
-      orca.log(`agents.list failed: ${String(error)}`)
-      return []
-    }
-  }
-
-  async function state(): Promise<TodoState> {
-    let tasks: Task[] = []
-    let exists = false
-    let fileProblem = problem
-    if (workspace && !problem) {
+  async function state(selection = preferred): Promise<ProgressState> {
+    const visibleWorkspace = workspace && { id: workspace.id, name: workspace.name }
+    const empty = { workspace: visibleWorkspace, file: null, candidates: [], plan: null, problem }
+    if (!workspace || problem) return empty
+    const root = workspace.path
+    const results = await Promise.all(FILES.map(async (file) => {
       try {
-        const source = await readTodo()
-        exists = source !== null
-        tasks = source ? parseTasks(source) : []
-      } catch (error) {
-        fileProblem = `Could not read ${FILE}: ${String(error)}`
+        return { file, plan: await readPlan(root, file), failed: false }
+      } catch {
+        return { file, plan: null, failed: true }
+      }
+    }))
+    const candidates = results.filter((result) => result.plan).map((result) => result.file)
+    const chosen = results.find((result) => result.file === selection && (result.plan || result.failed))
+      ?? results.find((result) => result.plan || result.failed)
+    if (chosen?.failed) {
+      return {
+        ...empty, ...lastGood, candidates,
+        problem: `Falha ao ler ${chosen.file}.`
       }
     }
-    return {
-      workspace: workspace && { name: workspace.name, path: workspace.path },
-      choices: choices.map((c) => ({ id: c.id, name: c.name, path: c.path })),
-      problem: fileProblem,
-      exists,
-      tasks,
-      agents: workspace ? await listAgents() : [],
-      queue: await readQueue()
-    }
+    lastGood = { file: chosen?.file ?? null, plan: chosen?.plan ?? null, candidates }
+    return { workspace: visibleWorkspace, ...lastGood, problem: watchProblem }
   }
 
-  async function broadcast(): Promise<TodoState> {
-    const current = await state()
-    orca.panels.post('todos.changed', current)
-    return current
+  async function broadcast(): Promise<void> {
+    orca.panels.post('progress.changed', await state())
   }
 
-  function watchFile(): void {
-    watcher?.close()
-    watcher = null
-    if (!workspace || problem) return
+  function closeWatchers(): void {
+    rootWatcher?.close()
+    docsWatcher?.close()
+    rootWatcher = docsWatcher = undefined
+    clearTimeout(debounce)
+    refreshDocs = false
+  }
+  stopWatching = closeWatchers
+
+  function scheduleUpdate(rebind = false): void {
+    refreshDocs ||= rebind
+    clearTimeout(debounce)
+    const watched = workspace
+    debounce = setTimeout(() => {
+      void serial(async () => {
+        if (workspace !== watched) return
+        if (refreshDocs && workspace) {
+          refreshDocs = false
+          watchDocs(workspace.path)
+        }
+        await broadcast()
+      }).catch((error) => orca.log(`Falha ao atualizar o plano: ${String(error)}`))
+    }, 80)
+  }
+
+  function watchFolder(path: string, scope: '' | 'docs/'): FSWatcher {
+    // Um save por rename troca o inode do arquivo, então observamos o diretório.
+    const watcher = watch(path, (_event, name) => {
+      const relative = name && scope + name.toString()
+      if (!relative || FILES.includes(relative) || relative === 'docs') {
+        scheduleUpdate(!scope && (!relative || relative === 'docs'))
+      }
+    })
+    watcher.on('error', (error) => {
+      if (scope && missing(error)) {
+        scheduleUpdate(true)
+        return
+      }
+      watcher.close()
+      if (scope) docsWatcher = undefined
+      else rootWatcher = undefined
+      watchProblem = 'Não foi possível observar o plano. Reabra o painel para tentar novamente.'
+      scheduleUpdate()
+    })
+    return watcher
+  }
+
+  function watchDocs(root: string): void {
+    docsWatcher?.close()
+    docsWatcher = undefined
     try {
-      // Watch the folder, not the file: editors and agents often replace the file on save,
-      // which ends a watch on the old file.
-      watcher = watch(workspace.path, (_event, name) => {
-        if (name && name.toString() !== FILE) return
-        if (debounce) clearTimeout(debounce)
-        debounce = setTimeout(() => void broadcast(), 80)
-      })
+      const docs = join(root, 'docs')
+      if (lstatSync(docs).isDirectory()) docsWatcher = watchFolder(docs, 'docs/')
     } catch (error) {
-      orca.log(`watch failed: ${String(error)}`)
+      if (!missing(error)) watchProblem = 'Não foi possível observar a pasta docs.'
     }
   }
 
-  async function terminalMap(): Promise<Record<string, string>> {
-    const value = await orca.storage.get(TERMINALS)
-    return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, string>) : {}
-  }
-
-  async function remember(terminalIds: string[], workspaceId: string): Promise<void> {
-    const map = await terminalMap()
-    if (terminalIds.every((id) => map[id] === workspaceId)) return
-    for (const id of terminalIds) map[id] = workspaceId
-    // Keep the map small: terminal ids do not come back once closed.
-    const entries = Object.entries(map).slice(-500)
-    await orca.storage.set(TERMINALS, Object.fromEntries(entries))
-  }
-
-  function useWorkspace(match: Candidate | null): void {
-    const next: Workspace = match && { id: match.id, name: match.name, path: match.path }
-    problem = null
-    if (match?.hostId && match.hostId !== 'local') problem = 'Remote workspaces are not supported yet.'
-    else if (match && !existsSync(match.path)) problem = `Folder not found: ${match.path}`
-    const changed = next?.path !== workspace?.path
-    workspace = next
-    if (changed) watchFile()
-  }
-
-  /**
-   * Orca's context names the focused workspace only by display name and branch, which many
-   * repos share ("main"). Narrow by those, then by terminals we have seen in a workspace, else
-   * ask the person to pick.
-   */
   async function resolveWorkspace(context: Context): Promise<void> {
-    lastContext = context
-    choices = []
-    if (!context) {
-      useWorkspace(null)
-      return void (await broadcast())
+    let next: Workspace | null = null
+    problem = null
+    if (context) {
+      try {
+        const { workspaces } = await orca.host.call('workspace.list')
+        const matches = context.workspaceId
+          ? workspaces.filter((candidate) => candidate.id === context.workspaceId)
+          : workspaces.filter((candidate) =>
+            candidate.name === context.displayName && shortBranch(candidate.branch) === shortBranch(context.branch))
+        const match = matches.length === 1 ? matches[0] : undefined
+        if (!match) problem = 'O ORCA não identificou um workspace único para este painel.'
+        else if (match.hostId && match.hostId !== 'local') problem = 'Abra um workspace local para ver seu plano.'
+        else next = { id: match.id, name: match.project || match.name, path: await realpath(match.path) }
+      } catch {
+        problem = 'Não foi possível localizar a pasta do workspace em foco.'
+      }
     }
-    const { workspaces } = await orca.host.call('workspace.list')
-    const branch = shortBranch(context.branch)
-    let candidates: Candidate[] = workspaces.filter(
-      (w) => w.name === context.displayName && shortBranch(w.branch) === branch
-    )
-    if (!candidates.length) candidates = workspaces.filter((w) => w.name === context.displayName)
-    let match: Candidate | null = candidates.length === 1 ? candidates[0] : null
-    if (!match && candidates.length > 1) {
-      const map = await terminalMap()
-      const known = new Set(context.terminals.map((t) => map[t.id]).filter(Boolean))
-      const hits = candidates.filter((c) => known.has(c.id))
-      if (hits.length === 1) match = hits[0]
-      else choices = hits.length > 1 ? hits : candidates
-    }
-    useWorkspace(match)
-    await broadcast()
-  }
-
-  async function editFile(change: (source: string | null) => string | null): Promise<void> {
-    const path = filePath()
-    if (!path || problem) throw hostError('not_permitted', 'No local worktree is focused.')
-    const next = change(await readTodo())
-    if (next === null) throw hostError('conflict', `${FILE} changed; showing the latest version.`)
-    await writeFile(path, next, 'utf8')
-  }
-
-  /** Sends every queued message for an idle agent's terminal as one prompt. */
-  async function flush(terminalId: string): Promise<void> {
-    const queue = await readQueue()
-    const mine = queue.filter((m) => m.terminalId === terminalId)
-    if (!mine.length) return
-    const text =
-      mine.length === 1
-        ? mine[0].text
-        : `[todos] ${mine.map((m) => m.text.replace(/^\[todos\]\s*/, '')).join(' Also: ')}`
-    try {
-      await orca.host.call('terminal.sendText', { terminalId, text, enter: true })
-    } catch (error) {
-      // The terminal is gone: drop its messages instead of retrying forever.
-      orca.log(`send to ${terminalId} failed, dropping ${mine.length} message(s): ${String(error)}`)
-    }
-    await writeQueue((await readQueue()).filter((m) => m.terminalId !== terminalId))
-  }
-
-  async function enqueue(terminalId: string, taskText: string, text: string): Promise<void> {
-    const agents = await listAgents()
-    const agent = agents.find((a) => a.terminalId === terminalId)
-    const message: QueuedMessage = {
-      id: `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
-      terminalId,
-      agentLabel: agent?.label ?? 'Agent',
-      taskText,
-      text,
-      createdAt: Date.now()
-    }
-    await writeQueue([...(await readQueue()), message])
-    // Already idle: nothing to wait for.
-    if (agent && IDLE.has(agent.state)) await flush(terminalId)
-  }
-
-  // --- Events -------------------------------------------------------------------------------
-
-  orca.events.on('workspace.changed', ({ context }) => serial(() => resolveWorkspace(context)))
-
-  orca.events.on('agent.status.changed', ({ terminalId, workspaceId, state: agentState }) =>
-    serial(async () => {
-      if (terminalId && workspaceId) {
-        await remember([terminalId], workspaceId)
-        // A terminal of the focused workspace just told us which workspace it is.
-        if (choices.length && lastContext?.terminals.some((t) => t.id === terminalId)) {
-          const hit = choices.find((c) => c.id === workspaceId)
-          if (hit) {
-            choices = []
-            useWorkspace(hit)
-          }
+    if (workspace?.id !== next?.id || workspace?.path !== next?.path) {
+      closeWatchers()
+      lastGood = undefined
+      preferred = undefined
+      workspace = next
+      if (next) {
+        try {
+          const saved = await orca.storage.get(`plan:${next.id}`)
+          if (typeof saved === 'string' && FILES.includes(saved)) preferred = saved
+        } catch (error) {
+          orca.log(`Falha ao ler a escolha do plano: ${String(error)}`)
         }
       }
-      if (terminalId && IDLE.has(agentState)) await flush(terminalId)
-      await broadcast()
-    })
-  )
+    }
+    if (workspace && (!rootWatcher || watchProblem)) {
+      closeWatchers()
+      watchProblem = null
+      try {
+        rootWatcher = watchFolder(workspace.path, '')
+        watchDocs(workspace.path)
+      } catch {
+        watchProblem = 'Não foi possível observar o plano. Reabra o painel para tentar novamente.'
+      }
+    }
+  }
 
-  // --- Panel requests -----------------------------------------------------------------------
+  orca.events.on('workspace.changed', ({ context }) => serial(async () => {
+    await resolveWorkspace(context)
+    await broadcast()
+  }))
 
-  orca.panels.handle('todos.get', () =>
-    serial(async () => {
-      if (!workspace && !choices.length) await resolveWorkspace(await orca.host.call('workspace.readContext'))
-      return state()
-    })
-  )
+  orca.panels.handle('progress.get', () => serial(async () => {
+    await resolveWorkspace(await orca.host.call('workspace.readContext'))
+    return state()
+  }))
 
-  orca.panels.handle('todos.setDone', ({ id, done }) =>
-    serial(async () => {
-      await editFile((source) => (source === null ? null : setTaskDone(source, id, done)))
-      return broadcast()
-    })
-  )
-
-  orca.panels.handle('todos.confirm', ({ id, terminalId }) =>
-    serial(async () => {
-      const task = parseTasks((await readTodo()) ?? '').find((t) => t.id === id)
-      if (!task) throw hostError('conflict', `${FILE} changed; showing the latest version.`)
-      await editFile((source) => (source === null ? null : setTaskDone(source, id, true)))
-      await enqueue(
-        terminalId,
-        task.text,
-        `[todos] I finished a task you asked me to do in ${FILE}: "${task.text}". It is checked off; carry on with anything that was waiting on it.`
-      )
-      return broadcast()
-    })
-  )
-
-  orca.panels.handle('todos.add', ({ owner, text }: { owner: Owner; text: string }) =>
-    serial(async () => {
-      if (!text.trim()) throw hostError('invalid_params', 'A task needs some text.')
-      await editFile((source) => addTask(source, owner, text))
-      return broadcast()
-    })
-  )
-
-  orca.panels.handle('todos.create', () =>
-    serial(async () => {
-      await editFile((source) => source ?? TODO_TEMPLATE)
-      return broadcast()
-    })
-  )
-
-  orca.panels.handle('todos.brief', ({ terminalId }) =>
-    serial(async () => {
-      await enqueue(
-        terminalId,
-        'How to use TODO.md',
-        `[todos] This worktree keeps a shared task list in ${FILE} at its root, which I see in a side panel. ` +
-          `As you work, add tasks you plan to do as "- [ ] @agent <task>" and check them off ("- [x]") when done. ` +
-          `When you need me to do something by hand, add "- [ ] @me <task>"; when I check it off you will get a message starting with "[todos]". ` +
-          `Only edit task lines. Read ${FILE} now if it exists.`
-      )
-      return broadcast()
-    })
-  )
-
-  orca.panels.handle('todos.pick', ({ workspaceId }) =>
-    serial(async () => {
-      const hit = choices.find((c) => c.id === workspaceId)
-      if (!hit) throw hostError('invalid_params', 'That project is not one of the choices.')
-      choices = []
-      useWorkspace(hit)
-      // Remember through this workspace's terminals, so the next focus resolves on its own.
-      if (lastContext?.terminals.length) await remember(lastContext.terminals.map((t) => t.id), hit.id)
-      return broadcast()
-    })
-  )
-
-  orca.panels.handle('todos.cancelQueued', ({ id }) =>
-    serial(async () => {
-      await writeQueue((await readQueue()).filter((m) => m.id !== id))
-      return broadcast()
-    })
-  )
+  orca.panels.handle('progress.select', ({ workspaceId, file }) => serial(async () => {
+    if (workspace?.id !== workspaceId || !FILES.includes(file)) throw new Error('Plano indisponível neste workspace.')
+    const before = await state()
+    if (!before.candidates.includes(file)) throw new Error('Este arquivo não contém um plano disponível.')
+    await orca.storage.set(`plan:${workspaceId}`, file)
+    preferred = file
+    const current = await state()
+    orca.panels.post('progress.changed', current)
+    return current
+  }))
 }
 
 export function deactivate(): void {
-  watcher?.close()
-  watcher = null
-  if (debounce) clearTimeout(debounce)
-  debounce = null
+  stopWatching?.()
+  stopWatching = undefined
 }
